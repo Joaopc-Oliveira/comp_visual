@@ -11,9 +11,51 @@ class MediaPipeARApp(ARApp):
         self.hands = self.mp_hands.Hands(min_detection_confidence=0.5, min_tracking_confidence=0.5)
         self.mp_drawing = mp.solutions.drawing_utils
 
+        # Variáveis para detecção de gestos
+        self.previous_left_hand = None
+        self.previous_right_hand = None
+        self.use_mediapipe_gesture_detection = True  # Alternar entre MediaPipe e o código do TP3 para gestos
+
         # Reutiliza imagens carregadas no TP3
         self.hand_overlay_image = self.synthetic_objects[0]  # Usa o primeiro objeto sintético como substituto para mãos
         self.use_mediapipe_face_detection = True  # Alternar entre MediaPipe e o modelo de detecção de faces antigo
+
+    def detect_gestures(self, frame):
+        """Detecta gestos utilizando MediaPipe."""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(rgb_frame)
+
+        if result.multi_hand_landmarks:
+            for hand_landmarks in result.multi_hand_landmarks:
+                # Coordenadas dos pontos da mão
+                h, w, _ = frame.shape
+                coords = [(int(lm.x * w), int(lm.y * h)) for lm in hand_landmarks.landmark]
+                wrist = coords[0]
+                index_tip = coords[8]
+                thumb_tip = coords[4]
+
+                # Detectar se a mão está aberta ou fechada
+                open_hand = index_tip[1] < wrist[1] and thumb_tip[1] < wrist[1]
+                closed_hand = index_tip[1] > wrist[1] and thumb_tip[1] > wrist[1]
+
+                if open_hand:
+                    print("Gesto detectado: Mão aberta")
+                elif closed_hand:
+                    print("Gesto detectado: Mão fechada")
+
+                # Detectar gestos personalizados (exemplo: swipe ou braços no ar)
+                if self.previous_left_hand and self.previous_right_hand:
+                    left_diff = self.previous_left_hand[0] - coords[0][0]
+                    right_diff = coords[0][0] - self.previous_right_hand[0]
+
+                    if left_diff > 50:
+                        print("Gesto detectado: Swipe Left com mão direita")
+                    elif right_diff > 50:
+                        print("Gesto detectado: Swipe Right com mão esquerda")
+
+                # Atualizar posições anteriores
+                self.previous_left_hand = coords[0]
+                self.previous_right_hand = coords[-1]
 
     def detect_and_replace_hands(self, frame):
         """Detecta mãos usando MediaPipe e substitui por uma imagem."""
@@ -31,7 +73,6 @@ class MediaPipeARApp(ARApp):
 
                 # Substituir mão por imagem
                 self.replace_object(frame, (x_min, y_min, x_max, y_max), self.hand_overlay_image)
-                print(f"Mão detectada e substituída: ({x_min}, {y_min}), ({x_max}, {y_max})")
 
                 # Opcional: desenhar landmarks para debug
                 self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
@@ -73,10 +114,13 @@ class MediaPipeARApp(ARApp):
                 if not self.is_object_moving(largest_face):  # Verifica se a face está imóvel
                     mask_index = (largest_face[0] // 100) % len(self.masks)
                     self.replace_face_with_mask(frame, largest_face, mask_index)
-                    print(f"Face detectada e substituída: ({largest_face[0]}, {largest_face[1]}), ({largest_face[2]}, {largest_face[3]})")
 
             # Detectar e substituir mãos
             self.detect_and_replace_hands(frame)
+
+            # Detectar gestos
+            if self.use_mediapipe_gesture_detection:
+                self.detect_gestures(frame)
 
             # Exibir o quadro
             cv2.imshow("MediaPipe AR App", frame)
