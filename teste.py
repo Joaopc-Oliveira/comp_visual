@@ -1,200 +1,85 @@
 import cv2
-import numpy as np
-import os
+import mediapipe as mp
+from tp3 import ARApp  # Importa a classe base do TP3
 
 
-class ARApp:
+class MediaPipeARApp(ARApp):
     def __init__(self):
-        # Inicializa os modelos
-        self.init_models()
-        # Inicializa a captura de vídeo
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            print("Erro ao acessar a câmera.")
-            exit()
+        super().__init__()
+        # Inicializa MediaPipe para detecção de mãos
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.mp_drawing = mp.solutions.drawing_utils
 
-        # Configura a resolução da câmera
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Reutiliza imagens carregadas no TP3
+        self.hand_overlay_image = self.synthetic_objects[0]  # Usa o primeiro objeto sintético como substituto para mãos
+        self.use_mediapipe_face_detection = True  # Alternar entre MediaPipe e o modelo de detecção de faces antigo
 
-        # Carrega máscaras e objetos sintéticos
-        self.masks = [
-            cv2.imread("maskscream.png", cv2.IMREAD_UNCHANGED),
-            cv2.imread("mask_myers.png", cv2.IMREAD_UNCHANGED),
-            cv2.imread("grinch.png", cv2.IMREAD_UNCHANGED)
-        ]
-        self.synthetic_objects = [
-            cv2.imread("grinch.png", cv2.IMREAD_UNCHANGED),
-            cv2.imread("mask_myers.png", cv2.IMREAD_UNCHANGED),
-            cv2.imread("maskscream.png", cv2.IMREAD_UNCHANGED)
-        ]
-        for i, mask in enumerate(self.masks + self.synthetic_objects):
-            if mask is None:
-                print(f"Erro: Arquivo {i + 1} não foi carregado corretamente.")
-                exit()
+    def detect_and_replace_hands(self, frame):
+        """Detecta mãos usando MediaPipe e substitui por uma imagem."""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(rgb_frame)
 
-        self.previous_face_box = None
-        self.previous_object_box = None
-        self.face_stationary_frames = 0
-        self.object_movement_frames = 0
-        self.stationary_threshold = 10
-        self.movement_threshold = 10
+        if result.multi_hand_landmarks:
+            for hand_landmarks in result.multi_hand_landmarks:
+                # Obtém os limites da mão
+                h, w, _ = frame.shape
+                x_coords = [int(lm.x * w) for lm in hand_landmarks.landmark]
+                y_coords = [int(lm.y * h) for lm in hand_landmarks.landmark]
+                x_min, x_max = min(x_coords), max(x_coords)
+                y_min, y_max = min(y_coords), max(y_coords)
 
-    def init_models(self):
-        # Modelo de detecção de faces SSD
-        self.face_prototxt = "deploy.prototxt.txt"
-        self.face_model = "res10_300x300_ssd_iter_140000.caffemodel"
-        if not os.path.exists(self.face_prototxt) or not os.path.exists(self.face_model):
-            print("Modelos de detecção de faces não encontrados.")
-            exit()
-        self.face_net = cv2.dnn.readNetFromCaffe(self.face_prototxt, self.face_model)
+                # Substituir mão por imagem
+                self.replace_object(frame, (x_min, y_min, x_max, y_max), self.hand_overlay_image)
+                print(f"Mão detectada e substituída: ({x_min}, {y_min}), ({x_max}, {y_max})")
 
-        # YOLO para detecção de objetos
-        self.yolo_net = cv2.dnn.readNet("yolov4.weights", "yolov4.cfg")
-        with open("coco.names", "r") as f:
-            self.classes = [line.strip() for line in f.readlines()]
-        self.layer_names = self.yolo_net.getLayerNames()
-        self.output_layers = [self.layer_names[i - 1] for i in self.yolo_net.getUnconnectedOutLayers()]
+                # Opcional: desenhar landmarks para debug
+                self.mp_drawing.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
 
-        # Definir objetos a serem substituídos
-        self.target_objects = ["bottle", "cup", "cell phone"]
-
-    def detect_faces(self, frame):
-        h, w = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
-        self.face_net.setInput(blob)
-        detections = self.face_net.forward()
-        faces = []
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence > 0.6:
-                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                (startX, startY, endX, endY) = box.astype("int")
-                if endX - startX > 0 and endY - startY > 0:
-                    faces.append((startX, startY, endX, endY))
-        return faces
-
-    def detect_objects_yolo(self, frame):
-        height, width, _ = frame.shape
-        blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
-        self.yolo_net.setInput(blob)
-        outs = self.yolo_net.forward(self.output_layers)
-
-        class_ids = []
-        confidences = []
-        boxes = []
-
-        for out in outs:
-            for detection in out:
-                scores = detection[5:]
-                class_id = np.argmax(scores)
-                confidence = scores[class_id]
-                if confidence > 0.5:
-                    center_x = int(detection[0] * width)
-                    center_y = int(detection[1] * height)
-                    w = int(detection[2] * width)
-                    h = int(detection[3] * height)
-                    x = int(center_x - w / 2)
-                    y = int(center_y - h / 2)
-                    boxes.append([x, y, w, h])
-                    confidences.append(float(confidence))
-                    class_ids.append(class_id)
-
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-        detections = []
-        if len(indices) > 0:
-            for i in indices.flatten():
-                x, y, w, h = boxes[i]
-                class_name = self.classes[class_ids[i]]
-                detections.append({
-                    'class_name': class_name,
-                    'box': (x, y, x + w, y + h),
-                    'confidence': confidences[i]
-                })
-        return detections
-
-    def is_object_moving(self, current_box):
-        if self.previous_object_box is None:
-            self.previous_object_box = current_box
-            self.object_movement_frames = 0
-            return False
-
-        x_diff = abs(current_box[0] - self.previous_object_box[0])
-        y_diff = abs(current_box[1] - self.previous_object_box[1])
-
-        if x_diff > 10 or y_diff > 10:
-            self.object_movement_frames += 1
-        else:
-            self.object_movement_frames = 0
-
-        self.previous_object_box = current_box
-        return self.object_movement_frames >= self.movement_threshold
-
-    def replace_object(self, frame, box, synthetic_obj):
-        startX, startY, endX, endY = box
-        obj_width = endX - startX
-        obj_height = endY - startY
-
-        # Verifica se a região é válida
-        if obj_width <= 0 or obj_height <= 0:
-            print("Dimensões inválidas para o objeto detectado.")
-            return
-
-        # Redimensiona o objeto sintético
-        obj_resized = cv2.resize(synthetic_obj, (obj_width, obj_height))
-
-        # Ajusta o recorte do frame para coincidir com as dimensões do objeto
-        cropped_frame = frame[startY:endY, startX:endX]
-        h, w, _ = cropped_frame.shape
-        obj_resized = obj_resized[:h, :w]  # Garante que as dimensões coincidem
-
-        # Aplica o alfa para sobreposição
-        alpha_mask = obj_resized[:, :, 3] / 255.0
-        alpha_frame = 1.0 - alpha_mask
-
-        for c in range(3):
-            cropped_frame[:, :, c] = (alpha_mask * obj_resized[:, :, c] +
-                                      alpha_frame * cropped_frame[:, :, c])
-
-    def replace_face_with_mask(self, frame, box, mask_index):
-        startX, startY, endX, endY = box
-        face_width = endX - startX
-        face_height = endY - startY
-
-        mask = self.masks[mask_index]
-        mask_resized = cv2.resize(mask, (face_width, face_height))
-
-        alpha_mask = mask_resized[:, :, 3] / 255.0
-        alpha_frame = 1.0 - alpha_mask
-
-        for c in range(3):
-            frame[startY:endY, startX:endX, c] = (alpha_mask * mask_resized[:, :, c] +
-                                                  alpha_frame * frame[startY:endY, startX:endX, c])
+    def detect_faces_mediapipe(self, frame):
+        """Detecta faces usando MediaPipe."""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        with mp.solutions.face_detection.FaceDetection(min_detection_confidence=0.5) as face_detection:
+            results = face_detection.process(rgb_frame)
+            faces = []
+            if results.detections:
+                for detection in results.detections:
+                    bboxC = detection.location_data.relative_bounding_box
+                    ih, iw, _ = frame.shape
+                    x_min = int(bboxC.xmin * iw)
+                    y_min = int(bboxC.ymin * ih)
+                    x_max = int((bboxC.xmin + bboxC.width) * iw)
+                    y_max = int((bboxC.ymin + bboxC.height) * ih)
+                    faces.append((x_min, y_min, x_max, y_max))
+            return faces
 
     def run(self):
+        """Loop principal do aplicativo."""
         while True:
             ret, frame = self.cap.read()
             if not ret:
+                print("Erro ao capturar o quadro da câmera.")
                 break
 
-            # Detecta faces
-            faces = self.detect_faces(frame)
+            # Alternar entre MediaPipe e o modelo de detecção de faces antigo
+            if self.use_mediapipe_face_detection:
+                faces = self.detect_faces_mediapipe(frame)
+            else:
+                faces = self.detect_faces(frame)
+
+            # Substituir a maior face imóvel por máscara
             if faces:
                 largest_face = max(faces, key=lambda box: (box[2] - box[0]) * (box[3] - box[1]))
-                if self.is_object_moving(largest_face):
+                if not self.is_object_moving(largest_face):  # Verifica se a face está imóvel
                     mask_index = (largest_face[0] // 100) % len(self.masks)
                     self.replace_face_with_mask(frame, largest_face, mask_index)
+                    print(f"Face detectada e substituída: ({largest_face[0]}, {largest_face[1]}), ({largest_face[2]}, {largest_face[3]})")
 
-            # Detecta objetos
-            objects = self.detect_objects_yolo(frame)
-            target_objs = [o for o in objects if o['class_name'] in self.target_objects]
-            if target_objs:
-                largest_obj = max(target_objs, key=lambda o: (o['box'][2] - o['box'][0]) * (o['box'][3] - o['box'][1]))
-                if self.is_object_moving(largest_obj['box']):
-                    synthetic_obj = self.synthetic_objects[0]
-                    self.replace_object(frame, largest_obj['box'], synthetic_obj)
+            # Detectar e substituir mãos
+            self.detect_and_replace_hands(frame)
 
-            cv2.imshow("AR App", frame)
+            # Exibir o quadro
+            cv2.imshow("MediaPipe AR App", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
@@ -203,5 +88,5 @@ class ARApp:
 
 
 if __name__ == "__main__":
-    app = ARApp()
+    app = MediaPipeARApp()
     app.run()
